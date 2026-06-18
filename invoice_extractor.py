@@ -1,8 +1,10 @@
 """
 Extrait montant, date, fournisseur et numero de facture
-depuis un PDF, pour pouvoir le passer au moteur de matching.
+depuis une facture (PDF avec texte, PDF scanne, JPG ou PNG),
+pour pouvoir la passer au moteur de matching.
 """
 
+import os
 import re
 from datetime import datetime
 from typing import Optional
@@ -12,8 +14,14 @@ from matching_engine import Invoice
 
 class InvoiceExtractor:
 
+    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+
+    # Les motifs "total" / "montant" tolerent des mots entre le mot-cle
+    # et le nombre (ex: "Total pour cette ligne 32,99"), et ne dependent
+    # plus de la presence du symbole €.
     AMOUNT_PATTERNS = [
-        r"total\s*(?:incl\.?\s*vat|ttc|à payer)?\s*:?\s*([\d\s]+[.,]\d{2})\s*€?",
+        r"total\b[^\n€$]{0,50}?(\d{1,3}(?:[\s.]\d{3})*[.,]\d{2})",
+        r"montant\s+(?:prélevé|à payer|ttc)\b[^\n€$]{0,50}?(\d{1,3}(?:[\s.]\d{3})*[.,]\d{2})",
         r"([\d\s]+[.,]\d{2})\s*€",
         r"€\s*([\d\s]+[.,]\d{2})",
         r"\$\s*([\d\s]+[.,]\d{2})",
@@ -35,10 +43,19 @@ class InvoiceExtractor:
         r"\b(F-\d{4}-\d{3,})\b",
         r"(?:numéro de la facture|invoice number)\s*:?\s*([A-Z0-9]{6,})",
         r"(?:facture\s*n[°o]|invoice\s*n[°o])\s*:?\s*([A-Z0-9\-]+)",
+        r"\bn[°o]\s*de\s*facture\s*:?\s*([A-Z0-9\-]+)",
     ]
 
     def extract(self, pdf_path: str) -> Invoice:
-        text = self._extract_text(pdf_path)
+        ext = os.path.splitext(pdf_path)[1].lower()
+
+        if ext in self.IMAGE_EXTENSIONS:
+            text = self._extract_text_from_image(pdf_path)
+        else:
+            text = self._extract_text(pdf_path)
+            if not text.strip():
+                # PDF scanne (juste une image dans un PDF) -> on tente l'OCR
+                text = self._extract_text_via_ocr_pdf(pdf_path)
 
         amount = self._find_amount(text)
         date = self._find_date(text)
@@ -64,11 +81,38 @@ class InvoiceExtractor:
         except ImportError:
             raise RuntimeError("pdfplumber requis : pip install pdfplumber")
 
+    @staticmethod
+    def _ocr_image(image) -> str:
+        import pytesseract
+        try:
+            # On essaie francais + anglais d'abord (meilleure precision sur
+            # les mots francais), et on retombe sur l'anglais seul si le
+            # pack de langue francais n'est pas installe sur le serveur.
+            return pytesseract.image_to_string(image, lang="fra+eng")
+        except Exception:
+            return pytesseract.image_to_string(image)
+
+    def _extract_text_from_image(self, image_path: str) -> str:
+        from PIL import Image
+        image = Image.open(image_path)
+        return self._ocr_image(image)
+
+    def _extract_text_via_ocr_pdf(self, pdf_path: str) -> str:
+        try:
+            from pdf2image import convert_from_path
+        except ImportError:
+            raise RuntimeError(
+                "pdf2image requis pour l'OCR des PDF scannes : "
+                "pip install pdf2image (necessite aussi poppler)"
+            )
+        pages = convert_from_path(pdf_path)
+        return "\n".join(self._ocr_image(p) for p in pages)
+
     def _find_amount(self, text: str) -> Optional[float]:
         text_lower = text.lower()
         best_amount = None
 
-        # Priorise les montants pres du mot "total"
+        # Priorise les montants pres des mots "total" / "montant"
         for pattern in self.AMOUNT_PATTERNS:
             matches = re.findall(pattern, text_lower)
             for m in matches:
