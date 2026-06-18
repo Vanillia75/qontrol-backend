@@ -28,6 +28,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Extensions de facture acceptees a l'upload (PDF + photos/scans d'image)
+ALLOWED_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp")
+
 # --- Stockage en memoire pour le MVP ---
 # En production : remplacer par une vraie base (Postgres) avec cles API chiffrees
 SESSIONS: dict[str, dict] = {}
@@ -65,16 +68,18 @@ def connect_qonto(req: ConnectRequest):
 
 @app.post("/sessions/{session_id}/invoices/upload")
 async def upload_invoices(session_id: str, files: list[UploadFile] = File(...)):
-    """Etape 2 : le client uploade ses factures en vrac (PDF)."""
+    """Etape 2 : le client uploade ses factures en vrac (PDF, JPG ou PNG)."""
     if session_id not in SESSIONS:
         raise HTTPException(status_code=404, detail="Session introuvable")
 
     extractor = InvoiceExtractor()
     extracted = []
+    skipped = []
 
     tmp_dir = tempfile.mkdtemp()
     for file in files:
-        if not file.filename.lower().endswith(".pdf"):
+        if not file.filename.lower().endswith(ALLOWED_EXTENSIONS):
+            skipped.append(file.filename)
             continue
 
         file_path = os.path.join(tmp_dir, file.filename)
@@ -86,12 +91,14 @@ async def upload_invoices(session_id: str, files: list[UploadFile] = File(...)):
             invoice.id = file_path  # garde le chemin pour l'attachement ulterieur
             extracted.append(invoice)
         except Exception as e:
+            skipped.append(file.filename)
             continue
 
     SESSIONS[session_id]["invoices"].extend(extracted)
 
     return {
         "uploaded": len(extracted),
+        "skipped": skipped,
         "invoices": [
             {
                 "filename": inv.filename,
