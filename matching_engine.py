@@ -176,16 +176,28 @@ class MatchingEngine:
             return 0.0, []
 
         # --- Date ---
-        date_diff = abs((tx.date - inv.date).days)
-        if date_diff <= self.DATE_WINDOW_STRICT:
+        # Logique : une facture ne peut etre payee qu'apres avoir ete emise,
+        # jamais avant. On compare donc l'ecart de facon DIRECTIONNELLE
+        # (tx.date - inv.date), pas en valeur absolue.
+        days_after = (tx.date - inv.date).days
+
+        if days_after < -2:
+            # La transaction a eu lieu avant meme l'emission de la facture :
+            # incoherent, on rejette ce match completement.
+            return 0.0, []
+        elif 0 <= days_after <= self.DATE_WINDOW_STRICT:
             score += 0.35
-            reasons.append(f"Date quasi identique ({date_diff}j d'ecart)")
-        elif date_diff <= self.DATE_WINDOW_LOOSE:
+            reasons.append(f"Date quasi identique ({days_after}j apres la facture)")
+        elif 0 <= days_after <= self.DATE_WINDOW_LOOSE:
             score += 0.15
-            reasons.append(f"Date dans la fenetre ({date_diff}j d'ecart)")
+            reasons.append(f"Date coherente ({days_after}j apres la facture)")
+        elif -2 <= days_after < 0:
+            # Tolerance minime pour decalage horaire/journee de traitement
+            score += 0.10
+            reasons.append(f"Date quasi identique ({-days_after}j avant, marge de traitement)")
         else:
             score *= 0.5  # penalite forte mais pas elimination
-            reasons.append(f"Date eloignee ({date_diff}j d'ecart)")
+            reasons.append(f"Date eloignee ({days_after}j apres la facture)")
 
         # --- Numero de facture dans le texte ---
         if inv.invoice_number and tx.reference:
