@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
+import requests
+
 
 @dataclass
 class Transaction:
@@ -44,78 +46,130 @@ class MatchResult:
 
 class MatchingEngine:
     """
-    Logique de matching en cascade, du plus fiable au moins fiable :
-    1. Match exact (montant + date a 1 jour pres) -> confiance tres haute
-    2. Match montant exact + date large (7 jours) -> confiance haute
-    3. Match montant approche (tolerance devise/frais) + date -> confiance moyenne
-    4. Match par numero de facture trouve dans le texte -> confiance haute
+    Logique de matching :
+    1. On calcule un score pour CHAQUE paire (transaction, facture) possible.
+    2. On assigne en partant des meilleurs scores globaux en premier, pour
+       eviter qu'une transaction mediocre (mais traitee en premier) ne
+       "vole" une facture a une autre transaction qui matcherait bien mieux.
+    3. Les montants en devise etrangere sont convertis en EUR (taux de
+       change recupere en direct, avec une tolerance plus large pour
+       absorber les frais/marge de change appliques par la banque).
     """
 
-    AMOUNT_TOLERANCE_STRICT = 0.01  # 1 centime
-    AMOUNT_TOLERANCE_LOOSE = 1.50   # frais de change / arrondis
+    AMOUNT_TOLERANCE_STRICT = 0.01  # 1 centime (apres conversion en EUR)
+    AMOUNT_TOLERANCE_LOOSE = 1.50   # arrondis, petits frais
+    CROSS_CURRENCY_TOLERANCE_PCT = 0.12  # 12% : marge de change + frais bancaires
     DATE_WINDOW_STRICT = 1   # jours
     DATE_WINDOW_LOOSE = 14   # jours
+
+    # En dessous de ce score, on ne propose RIEN plutot qu'un match
+    # douteux : mieux vaut signaler une absence de match que de risquer
+    # de coller la mauvaise facture sur la mauvaise transaction.
+    MIN_MATCH_CONFIDENCE = 0.5
+
+    _fx_cache: dict[str, float] = {}
+
+    # Taux de secours si l'API de change est injoignable (approximatifs,
+    # mieux que rien mais a ne pas considerer comme exacts)
+    FALLBACK_RATES_TO_EUR = {
+        "USD": 0.92,
+        "GBP": 1.17,
+        "CHF": 1.04,
+        "EUR": 1.0,
+    }
 
     def __init__(self, transactions: list[Transaction], invoices: list[Invoice]):
         self.transactions = transactions
         self.invoices = invoices
 
+    @classmethod
+    def _rate_to_eur(cls, currency: str) -> float:
+        """Retourne combien vaut 1 unite de `currency` en EUR."""
+        if currency == "EUR":
+            return 1.0
+        if currency in cls._fx_cache:
+            return cls._fx_cache[currency]
+        try:
+            resp = requests.get(
+                "https://api.frankfurter.app/latest",
+                params={"from": currency, "to": "EUR"},
+                timeout=3,
+            )
+            rate = resp.json()["rates"]["EUR"]
+            cls._fx_cache[currency] = rate
+            return rate
+        except Exception:
+            return cls.FALLBACK_RATES_TO_EUR.get(currency, 1.0)
+
+    @classmethod
+    def _to_eur(cls, amount: float, currency: str) -> float:
+        return amount * cls._rate_to_eur(currency)
+
     def match_all(self) -> list[MatchResult]:
-        results = []
-        used_invoice_ids = set()
+        # 1. Score de chaque paire transaction <-> facture possible
+        candidates = []  # (score, tx_index, inv_index, reasons)
+        for ti, tx in enumerate(self.transactions):
+            for ii, inv in enumerate(self.invoices):
+                score, reasons = self._score_match(tx, inv)
+                if score >= self.MIN_MATCH_CONFIDENCE:
+                    candidates.append((score, ti, ii, reasons))
 
-        for tx in self.transactions:
-            best_match, confidence, reasons = self._find_best_match(tx, used_invoice_ids)
-            if best_match:
-                used_invoice_ids.add(best_match.id)
-            results.append(MatchResult(
-                transaction=tx,
-                invoice=best_match,
-                confidence=confidence,
-                reasons=reasons,
-            ))
-        return results
+        # 2. Assignation gloutonne en partant des MEILLEURS scores globaux,
+        #    pas dans l'ordre des transactions -> evite qu'un match mediocre
+        #    bloque un meilleur match potentiel trouve plus tard.
+        candidates.sort(key=lambda c: c[0], reverse=True)
 
-    def _find_best_match(
-        self, tx: Transaction, exclude_ids: set
-    ) -> tuple[Optional[Invoice], float, list[str]]:
-        candidates = []
-
-        for inv in self.invoices:
-            if inv.id in exclude_ids:
+        assigned: dict[int, tuple[int, float, list[str]]] = {}
+        used_invoices: set[int] = set()
+        for score, ti, ii, reasons in candidates:
+            if ti in assigned or ii in used_invoices:
                 continue
+            assigned[ti] = (ii, score, reasons)
+            used_invoices.add(ii)
 
-            score, reasons = self._score_match(tx, inv)
-            if score > 0:
-                candidates.append((inv, score, reasons))
-
-        if not candidates:
-            return None, 0.0, ["Aucune facture correspondante trouvee"]
-
-        candidates.sort(key=lambda c: c[1], reverse=True)
-        best_inv, best_score, best_reasons = candidates[0]
-        return best_inv, best_score, best_reasons
+        # 3. Construction des resultats dans l'ordre d'origine des transactions
+        results = []
+        for ti, tx in enumerate(self.transactions):
+            if ti in assigned:
+                ii, score, reasons = assigned[ti]
+                results.append(MatchResult(tx, self.invoices[ii], score, reasons))
+            else:
+                results.append(MatchResult(tx, None, 0.0, ["Aucune facture correspondante trouvee"]))
+        return results
 
     def _score_match(self, tx: Transaction, inv: Invoice) -> tuple[float, list[str]]:
         reasons = []
         score = 0.0
-
-        # --- Montant ---
-        amount_diff = abs(tx.amount - inv.amount)
         same_currency = tx.currency == inv.currency
+
+        # --- Montant (converti en EUR pour pouvoir comparer toutes les devises) ---
+        tx_eur = self._to_eur(tx.amount, tx.currency)
+        inv_eur = self._to_eur(inv.amount, inv.currency)
+        amount_diff = abs(tx_eur - inv_eur)
 
         if amount_diff <= self.AMOUNT_TOLERANCE_STRICT:
             score += 0.5
-            reasons.append(f"Montant exact ({inv.amount} {inv.currency})")
+            if same_currency:
+                reasons.append(f"Montant exact ({inv.amount} {inv.currency})")
+            else:
+                reasons.append(
+                    f"Montant exact apres conversion ({inv.amount} {inv.currency} "
+                    f"\u2248 {inv_eur:.2f} EUR)"
+                )
         elif amount_diff <= self.AMOUNT_TOLERANCE_LOOSE:
             score += 0.3
-            reasons.append(f"Montant proche (ecart {amount_diff:.2f})")
+            reasons.append(f"Montant proche (ecart {amount_diff:.2f} EUR)")
         elif not same_currency:
-            # Tolerance plus large si devises differentes (conversion possible)
-            ratio = max(tx.amount, inv.amount) / max(min(tx.amount, inv.amount), 0.01)
-            if 0.85 <= ratio <= 1.20:
+            # Tolerance plus large specifique aux devises etrangeres, pour
+            # absorber la marge de change appliquee par la banque/carte
+            pct_diff = amount_diff / max(tx_eur, 0.01)
+            if pct_diff <= self.CROSS_CURRENCY_TOLERANCE_PCT:
                 score += 0.2
-                reasons.append("Montant compatible avec conversion de devise")
+                reasons.append(
+                    f"Montant compatible avec conversion de devise "
+                    f"({inv.amount} {inv.currency} \u2248 {inv_eur:.2f} EUR, "
+                    f"ecart {pct_diff:.1%})"
+                )
             else:
                 return 0.0, []
         else:
@@ -131,6 +185,7 @@ class MatchingEngine:
             reasons.append(f"Date dans la fenetre ({date_diff}j d'ecart)")
         else:
             score *= 0.5  # penalite forte mais pas elimination
+            reasons.append(f"Date eloignee ({date_diff}j d'ecart)")
 
         # --- Numero de facture dans le texte ---
         if inv.invoice_number and tx.reference:
